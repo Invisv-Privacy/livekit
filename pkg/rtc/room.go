@@ -512,13 +512,13 @@ func (r *Room) IsClosed() bool {
 func (r *Room) CloseIfEmptyOrTimedOut() {
 	r.lock.Lock()
 
-	if r.IsClosed() || r.holds.Load() > 0 {
+	if r.IsClosed() || (r.holds.Load() > 0 && r.protoRoom.RoomTimeout == 0) {
 		r.lock.Unlock()
 		return
 	}
 
 	for _, p := range r.participants {
-		if !p.IsRecorder() {
+		if !p.IsRecorder() && r.protoRoom.RoomTimeout == 0 {
 			r.lock.Unlock()
 			return
 		}
