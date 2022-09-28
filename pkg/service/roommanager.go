@@ -163,7 +163,7 @@ func (r *RoomManager) CloseIdleRooms() {
 	r.lock.RUnlock()
 
 	for _, room := range rooms {
-		room.CloseIfEmpty()
+		room.CloseIfEmptyOrTimedOut()
 	}
 }
 
