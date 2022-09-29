@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/mitchellh/go-homedir"
@@ -63,6 +64,7 @@ type RTCConfig struct {
 	UseExternalIP     bool             `yaml:"use_external_ip"`
 	UseICELite        bool             `yaml:"use_ice_lite,omitempty"`
 	Interfaces        InterfacesConfig `yaml:"interfaces"`
+	IPs               IPsConfig        `yaml:"ips"`
 
 	// Number of packets to buffer for NACK
 	PacketBufferSize int `yaml:"packet_buffer_size,omitempty"`
@@ -102,6 +104,11 @@ type CongestionControlConfig struct {
 }
 
 type InterfacesConfig struct {
+	Includes []string `yaml:"includes"`
+	Excludes []string `yaml:"excludes"`
+}
+
+type IPsConfig struct {
 	Includes []string `yaml:"includes"`
 	Excludes []string `yaml:"excludes"`
 }
@@ -199,7 +206,7 @@ type IngressConfig struct {
 	RTMPBaseURL string `yaml:"rtmp_base_url"`
 }
 
-func NewConfig(confString string, c *cli.Context) (*Config, error) {
+func NewConfig(confString string, strictMode bool, c *cli.Context) (*Config, error) {
 	// start with defaults
 	conf := &Config{
 		Port: 7880,
@@ -259,7 +266,9 @@ func NewConfig(confString string, c *cli.Context) (*Config, error) {
 		Keys: map[string]string{},
 	}
 	if confString != "" {
-		if err := yaml.Unmarshal([]byte(confString), conf); err != nil {
+		decoder := yaml.NewDecoder(strings.NewReader(confString))
+		decoder.KnownFields(strictMode)
+		if err := decoder.Decode(conf); err != nil {
 			return nil, fmt.Errorf("could not parse config: %v", err)
 		}
 	}

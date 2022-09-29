@@ -69,7 +69,6 @@ const (
 	ParticipantCloseReasonVerifyFailed
 	ParticipantCloseReasonJoinFailed
 	ParticipantCloseReasonJoinTimeout
-	ParticipantCloseReasonRTCSessionFinish
 	ParticipantCloseReasonStateDisconnected
 	ParticipantCloseReasonPeerConnectionDisconnected
 	ParticipantCloseReasonDuplicateIdentity
@@ -100,8 +99,6 @@ func (p ParticipantCloseReason) String() string {
 		return "JOIN_FAILED"
 	case ParticipantCloseReasonJoinTimeout:
 		return "JOIN_TIMEOUT"
-	case ParticipantCloseReasonRTCSessionFinish:
-		return "RTC_SESSION_FINISH"
 	case ParticipantCloseReasonStateDisconnected:
 		return "STATE_DISCONNECTED"
 	case ParticipantCloseReasonPeerConnectionDisconnected:
