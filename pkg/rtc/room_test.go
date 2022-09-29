@@ -337,7 +337,7 @@ func TestRoomClosure(t *testing.T) {
 
 		time.Sleep(defaultDelay)
 
-		rm.CloseIfEmptyOrTimedOut()
+		rm.CloseIfEmpty()
 		require.Len(t, rm.GetParticipants(), 0)
 		require.True(t, isClosed)
 
@@ -351,7 +351,7 @@ func TestRoomClosure(t *testing.T) {
 			isClosed = true
 		})
 		require.NotZero(t, rm.protoRoom.EmptyTimeout)
-		rm.CloseIfEmptyOrTimedOut()
+		rm.CloseIfEmpty()
 		require.False(t, isClosed)
 	})
 
@@ -364,7 +364,7 @@ func TestRoomClosure(t *testing.T) {
 		rm.protoRoom.EmptyTimeout = 1
 
 		time.Sleep(1010 * time.Millisecond)
-		rm.CloseIfEmptyOrTimedOut()
+		rm.CloseIfEmpty()
 		require.True(t, isClosed)
 	})
 }

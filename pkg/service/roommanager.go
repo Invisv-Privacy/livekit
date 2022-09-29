@@ -154,7 +154,7 @@ func (r *RoomManager) CleanupRooms() error {
 	return nil
 }
 
-func (r *RoomManager) CloseIdleRooms() {
+func (r *RoomManager) CloseExpiredRooms() {
 	r.lock.RLock()
 	rooms := make([]*rtc.Room, 0, len(r.rooms))
 	for _, rm := range r.rooms {
@@ -163,7 +163,8 @@ func (r *RoomManager) CloseIdleRooms() {
 	r.lock.RUnlock()
 
 	for _, room := range rooms {
-		room.CloseIfEmptyOrTimedOut()
+		room.CloseIfEmpty()
+		room.CloseIfTimeout()
 	}
 }
 
@@ -309,7 +310,13 @@ func (r *RoomManager) StartSession(
 	}
 	if err = room.Join(participant, &opts, r.iceServersForRoom(protoRoom, iceConfig.PreferSub == types.PreferTls)); err != nil {
 		pLogger.Errorw("could not join room", err)
-		_ = participant.Close(true, types.ParticipantCloseReasonJoinFailed)
+		var closeReason types.ParticipantCloseReason
+		if errors.Is(err, rtc.ErrMaxParticipantsExceeded) {
+			closeReason = types.ParticipantCloseReasonCapacityReached
+		} else {
+			closeReason = types.ParticipantCloseReasonJoinFailed
+		}
+		_ = participant.Close(true, closeReason)
 		return err
 	}
 	if err = r.roomStore.StoreParticipant(ctx, roomName, participant.ToProto()); err != nil {

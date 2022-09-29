@@ -326,7 +326,7 @@ func (s *LivekitServer) backgroundWorker() {
 		case <-s.doneChan:
 			return
 		case <-roomTicker.C:
-			s.roomManager.CloseIdleRooms()
+			s.roomManager.CloseExpiredRooms()
 		}
 	}
 }

@@ -509,38 +509,59 @@ func (r *Room) IsClosed() bool {
 }
 
 // CloseIfEmpty closes the room if all participants had left, or it's still empty past timeout
-func (r *Room) CloseIfEmptyOrTimedOut() {
+// CloseIfEmpty closes the room if all participants had left, or it's still empty past timeout
+func (r *Room) CloseIfEmpty() {
 	r.lock.Lock()
 
-	if r.IsClosed() || (r.holds.Load() > 0 && r.protoRoom.RoomTimeout == 0) {
+	if r.IsClosed() || r.holds.Load() > 0 {
 		r.lock.Unlock()
 		return
 	}
 
 	for _, p := range r.participants {
-		if !p.IsRecorder() && r.protoRoom.RoomTimeout == 0 {
+		if !p.IsRecorder() {
 			r.lock.Unlock()
 			return
 		}
 	}
 
-	timeoutEmpty := r.protoRoom.EmptyTimeout
-	timeoutGlobal := r.protoRoom.RoomTimeout
-	var elapsedEmpty int64
-	elapsedGlobal := time.Now().Unix() - r.protoRoom.CreationTime
+	timeout := r.protoRoom.EmptyTimeout
+	var elapsed int64
 	if r.FirstJoinedAt() > 0 {
 		// exit 20s after
-		elapsedEmpty = time.Now().Unix() - r.LastLeftAt()
-		if timeoutEmpty > DefaultRoomDepartureGrace {
-			timeoutEmpty = DefaultRoomDepartureGrace
+		elapsed = time.Now().Unix() - r.LastLeftAt()
+		if timeout > DefaultRoomDepartureGrace {
+			timeout = DefaultRoomDepartureGrace
 		}
 	} else {
-		elapsedEmpty = elapsedGlobal
+		elapsed = time.Now().Unix() - r.protoRoom.CreationTime
 	}
 	r.lock.Unlock()
 
-	if (elapsedEmpty >= int64(timeoutEmpty)) ||
-		(timeoutGlobal > 0 && elapsedGlobal >= int64(timeoutGlobal)) {
+	if elapsed >= int64(timeout) {
+		r.Close()
+	}
+}
+
+// CloseIfTimeout closes the room if it is past timeout
+func (r *Room) CloseIfTimeout() {
+	r.lock.Lock()
+
+	if r.IsClosed() {
+		r.lock.Unlock()
+		return
+	}
+
+	timeout := r.protoRoom.RoomTimeout
+	if timeout == 0 {
+		r.lock.Unlock()
+		return
+	}
+
+	var elapsed int64 = time.Now().Unix() - r.protoRoom.CreationTime
+	r.lock.Unlock()
+
+	if elapsed >= int64(timeout) {
 		r.Close()
 	}
 }

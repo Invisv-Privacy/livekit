@@ -83,6 +83,7 @@ const (
 	ParticipantCloseReasonNegotiateFailed
 	ParticipantCloseReasonMigrationRequested
 	ParticipantCloseReasonOvercommitted
+	ParticipantCloseReasonCapacityReached
 )
 
 func (p ParticipantCloseReason) String() string {
@@ -127,6 +128,8 @@ func (p ParticipantCloseReason) String() string {
 		return "OVERCOMMITTED"
 	case ParticipantCloseReasonMigrationRequested:
 		return "MIGRATION_REQUESTED"
+	case ParticipantCloseReasonCapacityReached:
+		return "CAPACITY_REACHED"
 	default:
 		return fmt.Sprintf("%d", int(p))
 	}
@@ -159,6 +162,8 @@ func (p ParticipantCloseReason) ToDisconnectReason() livekit.DisconnectReason {
 		return livekit.DisconnectReason_SERVER_SHUTDOWN
 	case ParticipantCloseReasonNegotiateFailed:
 		return livekit.DisconnectReason_STATE_MISMATCH
+	case ParticipantCloseReasonCapacityReached:
+		return livekit.DisconnectReason_CAPACITY_REACHED
 	default:
 		// the other types will map to unknown reason
 		return livekit.DisconnectReason_UNKNOWN_REASON

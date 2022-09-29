@@ -98,4 +98,4 @@ require (
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 )
 
-replace github.com/livekit/protocol => github.com/Invisv-Privacy/livekit-protocol v0.0.0-20220928191523-37bb66403c61
+replace github.com/livekit/protocol => github.com/Invisv-Privacy/livekit-protocol v0.0.0-20220929205729-7b0cbf3577ab
