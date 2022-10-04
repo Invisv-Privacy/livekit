@@ -78,7 +78,7 @@ func NewWebRTCConfig(conf *config.Config, externalIP string) (*WebRTCConfig, err
 		rtcConf.PacketBufferSize = 500
 	}
 
-	var udpMux *ice.UDPMuxDefault
+	var udpMux ice.UDPMux
 	var udpMuxConn *net.UDPConn
 	var err error
 	networkTypes := make([]webrtc.NetworkType, 0, 4)
@@ -219,6 +219,49 @@ func NewWebRTCConfig(conf *config.Config, externalIP string) (*WebRTCConfig, err
 			if len(excludes) > 0 {
 				for _, iface := range excludes {
 					if iface == s {
+						return false
+					}
+				}
+			}
+			return true
+		})
+	}
+
+	if len(rtcConf.IPs.Includes) != 0 || len(rtcConf.IPs.Excludes) != 0 {
+		var ipnets [2][]*net.IPNet
+		for i, ips := range [][]string{rtcConf.IPs.Includes, rtcConf.IPs.Excludes} {
+			ipnets[i], err = func(fromIPs []string) ([]*net.IPNet, error) {
+				var toNets []*net.IPNet
+				for _, ip := range fromIPs {
+					_, ipnet, err := net.ParseCIDR(ip)
+					if err != nil {
+						return nil, err
+					}
+					toNets = append(toNets, ipnet)
+				}
+				return toNets, nil
+			}(ips)
+
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		includes, excludes := ipnets[0], ipnets[1]
+
+		s.SetIPFilter(func(ip net.IP) bool {
+			if len(includes) > 0 {
+				for _, ipn := range includes {
+					if ipn.Contains(ip) {
+						return true
+					}
+				}
+				return false
+			}
+
+			if len(excludes) > 0 {
+				for _, ipn := range excludes {
+					if ipn.Contains(ip) {
 						return false
 					}
 				}

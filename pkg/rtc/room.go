@@ -509,6 +509,7 @@ func (r *Room) IsClosed() bool {
 }
 
 // CloseIfEmpty closes the room if all participants had left, or it's still empty past timeout
+// CloseIfEmpty closes the room if all participants had left, or it's still empty past timeout
 func (r *Room) CloseIfEmpty() {
 	r.lock.Lock()
 
@@ -535,6 +536,29 @@ func (r *Room) CloseIfEmpty() {
 	} else {
 		elapsed = time.Now().Unix() - r.protoRoom.CreationTime
 	}
+	r.lock.Unlock()
+
+	if elapsed >= int64(timeout) {
+		r.Close()
+	}
+}
+
+// CloseIfTimeout closes the room if it is past timeout
+func (r *Room) CloseIfTimeout() {
+	r.lock.Lock()
+
+	if r.IsClosed() {
+		r.lock.Unlock()
+		return
+	}
+
+	timeout := r.protoRoom.RoomTimeout
+	if timeout == 0 {
+		r.lock.Unlock()
+		return
+	}
+
+	var elapsed int64 = time.Now().Unix() - r.protoRoom.CreationTime
 	r.lock.Unlock()
 
 	if elapsed >= int64(timeout) {
