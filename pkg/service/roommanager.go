@@ -200,9 +200,6 @@ func (r *RoomManager) Stop() {
 		if r.rtcConfig.UDPMux != nil {
 			_ = r.rtcConfig.UDPMux.Close()
 		}
-		if r.rtcConfig.UDPMuxConn != nil {
-			_ = r.rtcConfig.UDPMuxConn.Close()
-		}
 		if r.rtcConfig.TCPMuxListener != nil {
 			_ = r.rtcConfig.TCPMuxListener.Close()
 		}
@@ -223,6 +220,10 @@ func (r *RoomManager) StartSession(
 	}
 	defer room.Release()
 
+	// only create the room, but don't start a participant session
+	if pi.Identity == "" {
+		return nil
+	}
 	participant := room.GetParticipant(pi.Identity)
 	if participant != nil {
 		// When reconnecting, it means WS has interrupted by underlying peer connection is still ok
@@ -280,6 +281,11 @@ func (r *RoomManager) StartSession(
 	if r.config.RTC.AllowTCPFallback != nil {
 		allowFallback = *r.config.RTC.AllowTCPFallback
 	}
+	// default do not force full reconnect on a publication error
+	reconnectOnPublicationError := false
+	if r.config.RTC.ReconnectOnPublicationError != nil {
+		reconnectOnPublicationError = *r.config.RTC.ReconnectOnPublicationError
+	}
 	participant, err = rtc.NewParticipant(rtc.ParticipantParams{
 		Identity:                pi.Identity,
 		Name:                    pi.Name,
@@ -301,6 +307,13 @@ func (r *RoomManager) StartSession(
 		AdaptiveStream:          pi.AdaptiveStream,
 		AllowTCPFallback:        allowFallback,
 		TURNSEnabled:            r.config.IsTURNSEnabled(),
+		GetParticipantInfo: func(pID livekit.ParticipantID) *livekit.ParticipantInfo {
+			if p := room.GetParticipantBySid(pID); p != nil {
+				return p.ToProto()
+			}
+			return nil
+		},
+		ReconnectOnPublicationError: reconnectOnPublicationError,
 	})
 	if err != nil {
 		return err
@@ -584,7 +597,7 @@ func (r *RoomManager) handleRTCMessage(ctx context.Context, roomName livekit.Roo
 				"subscribe", rm.UpdateSubscriptions.Subscribe)
 		}
 	case *livekit.RTCNodeMessage_SendData:
-		pLogger.Debugw("SendData", "size", len(rm.SendData.Data))
+		pLogger.Debugw("api send data", "size", len(rm.SendData.Data))
 		up := &livekit.UserPacket{
 			Payload:         rm.SendData.Data,
 			DestinationSids: rm.SendData.DestinationSids,

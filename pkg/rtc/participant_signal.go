@@ -104,12 +104,16 @@ func (p *ParticipantImpl) SendSpeakerUpdate(speakers []*livekit.SpeakerInfo) err
 	})
 }
 
-func (p *ParticipantImpl) SendDataPacket(dp *livekit.DataPacket) error {
+func (p *ParticipantImpl) SendDataPacket(dp *livekit.DataPacket, data []byte) error {
 	if p.State() != livekit.ParticipantInfo_ACTIVE {
 		return ErrDataChannelUnavailable
 	}
 
-	return p.TransportManager.SendDataPacket(dp)
+	err := p.TransportManager.SendDataPacket(dp, data)
+	if err == nil {
+		p.dataChannelStats.AddBytes(uint64(len(data)), true)
+	}
+	return err
 }
 
 func (p *ParticipantImpl) SendRoomUpdate(room *livekit.Room) error {
@@ -139,7 +143,6 @@ func (p *ParticipantImpl) SendRefreshToken(token string) error {
 }
 
 func (p *ParticipantImpl) sendICECandidate(c *webrtc.ICECandidate, target livekit.SignalTarget) error {
-	p.params.Logger.Infow("sending ice candidate", "candidate", c.String(), "target", target)
 	trickle := ToProtoTrickle(c.ToJSON())
 	trickle.Target = target
 	return p.writeMessage(&livekit.SignalResponse{
