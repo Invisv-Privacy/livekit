@@ -21,9 +21,10 @@ import (
 	"github.com/livekit/livekit-server/pkg/rtc/supervisor"
 	"github.com/livekit/livekit-server/pkg/rtc/types"
 	"github.com/livekit/livekit-server/pkg/sfu"
+	"github.com/livekit/livekit-server/pkg/sfu/buffer"
 	"github.com/livekit/livekit-server/pkg/sfu/connectionquality"
-	"github.com/livekit/livekit-server/pkg/sfu/twcc"
 	"github.com/livekit/livekit-server/pkg/telemetry"
+	"github.com/livekit/mediatransportutil/pkg/twcc"
 	"github.com/livekit/protocol/auth"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
@@ -45,7 +46,7 @@ type pendingTrackInfo struct {
 
 type downTrackState struct {
 	transceiver *webrtc.RTPTransceiver
-	forwarder   sfu.ForwarderState
+	downTrack   sfu.DownTrackState
 }
 
 type SubscribeRequestType int
@@ -63,29 +64,31 @@ type SubscribeRequest struct {
 }
 
 type ParticipantParams struct {
-	Identity                livekit.ParticipantIdentity
-	Name                    livekit.ParticipantName
-	SID                     livekit.ParticipantID
-	Config                  *WebRTCConfig
-	Sink                    routing.MessageSink
-	AudioConfig             config.AudioConfig
-	VideoConfig             config.VideoConfig
-	ProtocolVersion         types.ProtocolVersion
-	Telemetry               telemetry.TelemetryService
-	PLIThrottleConfig       config.PLIThrottleConfig
-	CongestionControlConfig config.CongestionControlConfig
-	EnabledCodecs           []*livekit.Codec
-	Logger                  logger.Logger
-	SimTracks               map[uint32]SimulcastTrackInfo
-	Grants                  *auth.ClaimGrants
-	InitialVersion          uint32
-	ClientConf              *livekit.ClientConfiguration
-	ClientInfo              ClientInfo
-	Region                  string
-	Migration               bool
-	AdaptiveStream          bool
-	AllowTCPFallback        bool
-	TURNSEnabled            bool
+	Identity                    livekit.ParticipantIdentity
+	Name                        livekit.ParticipantName
+	SID                         livekit.ParticipantID
+	Config                      *WebRTCConfig
+	Sink                        routing.MessageSink
+	AudioConfig                 config.AudioConfig
+	VideoConfig                 config.VideoConfig
+	ProtocolVersion             types.ProtocolVersion
+	Telemetry                   telemetry.TelemetryService
+	PLIThrottleConfig           config.PLIThrottleConfig
+	CongestionControlConfig     config.CongestionControlConfig
+	EnabledCodecs               []*livekit.Codec
+	Logger                      logger.Logger
+	SimTracks                   map[uint32]SimulcastTrackInfo
+	Grants                      *auth.ClaimGrants
+	InitialVersion              uint32
+	ClientConf                  *livekit.ClientConfiguration
+	ClientInfo                  ClientInfo
+	Region                      string
+	Migration                   bool
+	AdaptiveStream              bool
+	AllowTCPFallback            bool
+	TURNSEnabled                bool
+	GetParticipantInfo          func(pID livekit.ParticipantID) *livekit.ParticipantInfo
+	ReconnectOnPublicationError bool
 }
 
 type ParticipantImpl struct {
@@ -113,6 +116,8 @@ type ParticipantImpl struct {
 	// client intended to publish, yet to be reconciled
 	pendingTracksLock sync.RWMutex
 	pendingTracks     map[string]*pendingTrackInfo
+	// migrated in muted tracks are not fired need close at participant close
+	mutedTrackNotFired []*MediaTrack
 
 	*TransportManager
 	*UpTrackManager
@@ -126,6 +131,8 @@ type ParticipantImpl struct {
 	// keep track of other publishers ids that we are subscribed to
 	subscribedTo      map[livekit.ParticipantID]struct{}
 	unpublishedTracks []*livekit.TrackInfo
+
+	dataChannelStats *telemetry.BytesTrackStats
 
 	rttUpdatedAt time.Time
 	lastRTT      uint32
@@ -182,7 +189,11 @@ func NewParticipant(params ParticipantParams) (*ParticipantImpl, error) {
 		subscriptionInProgress:    make(map[livekit.TrackID]bool),
 		subscriptionRequestsQueue: make(map[livekit.TrackID][]SubscribeRequest),
 		trackPublisherVersion:     make(map[livekit.TrackID]uint32),
-		supervisor:                supervisor.NewParticipantSupervisor(supervisor.ParticipantSupervisorParams{Logger: params.Logger}),
+		dataChannelStats: telemetry.NewBytesTrackStats(
+			telemetry.BytesTrackIDForParticipantID(telemetry.BytesTrackTypeData, params.SID),
+			params.SID,
+			params.Telemetry),
+		supervisor: supervisor.NewParticipantSupervisor(supervisor.ParticipantSupervisorParams{Logger: params.Logger}),
 	}
 	p.version.Store(params.InitialVersion)
 	p.migrateState.Store(types.MigrateStateInit)
@@ -190,9 +201,11 @@ func NewParticipant(params ParticipantParams) (*ParticipantImpl, error) {
 	p.grants = params.Grants
 	p.SetResponseSink(params.Sink)
 
+	p.supervisor.OnPublicationError(p.onPublicationError)
+
 	var err error
 	// keep last participants and when updates were sent
-	if p.updateCache, err = lru.New(32); err != nil {
+	if p.updateCache, err = lru.New(128); err != nil {
 		return nil, err
 	}
 
@@ -247,6 +260,10 @@ func (p *ParticipantImpl) GetClientConfiguration() *livekit.ClientConfiguration 
 
 func (p *ParticipantImpl) GetICEConnectionType() types.ICEConnectionType {
 	return p.TransportManager.GetICEConnectionType()
+}
+
+func (p *ParticipantImpl) GetBufferFactory() *buffer.Factory {
+	return p.params.Config.BufferFactory
 }
 
 // SetMetadata attaches metadata to the participant
@@ -412,137 +429,25 @@ func (p *ParticipantImpl) HandleOffer(offer webrtc.SessionDescription) {
 	p.TransportManager.HandleOffer(offer, shouldPend)
 }
 
-func (p *ParticipantImpl) setCodecPreferencesForPublisher(offer webrtc.SessionDescription) webrtc.SessionDescription {
-	offer = p.setCodecPreferencesOpusRedForPublisher(offer)
-	offer = p.setCodecPreferencesVideoForPublisher(offer)
-	return offer
-}
+// HandleAnswer handles a client answer response, with subscriber PC, server initiates the
+// offer and client answers
+func (p *ParticipantImpl) HandleAnswer(answer webrtc.SessionDescription) {
+	p.params.Logger.Infow("received answer", "transport", livekit.SignalTarget_SUBSCRIBER)
 
-func (p *ParticipantImpl) setCodecPreferencesOpusRedForPublisher(offer webrtc.SessionDescription) webrtc.SessionDescription {
-	parsed, lastAudio, err := p.TransportManager.GetLastUnmatchedMediaForOffer(offer, "audio")
-	if err != nil || lastAudio == nil {
-		return offer
-	}
+	/* from server received join request to client answer
+	 * 1. server send join response & offer
+	 * ... swap candidates
+	 * 2. client send answer
+	 */
+	signalConnCost := time.Since(p.ConnectedAt()).Milliseconds()
+	p.TransportManager.UpdateRTT(uint32(signalConnCost), false)
 
-	codecs, err := codecsFromMediaDescription(lastAudio)
-	if err != nil {
-		return offer
-	}
-
-	var opusPayload uint8
-	for _, codec := range codecs {
-		if strings.EqualFold(codec.Name, "opus") {
-			opusPayload = codec.PayloadType
-			break
-		}
-	}
-	if opusPayload == 0 {
-		return offer
-	}
-
-	var preferredCodecs, leftCodecs []string
-	for _, codec := range codecs {
-		// codec contain opus/red
-		if strings.EqualFold(codec.Name, "red") && strings.Contains(codec.Fmtp, strconv.FormatInt(int64(opusPayload), 10)) {
-			preferredCodecs = append(preferredCodecs, strconv.FormatInt(int64(codec.PayloadType), 10))
-		} else {
-			leftCodecs = append(leftCodecs, strconv.FormatInt(int64(codec.PayloadType), 10))
-		}
-	}
-
-	// no opus/red found
-	if len(preferredCodecs) == 0 {
-		return offer
-	}
-
-	lastAudio.MediaName.Formats = append(lastAudio.MediaName.Formats[:0], preferredCodecs...)
-	lastAudio.MediaName.Formats = append(lastAudio.MediaName.Formats, leftCodecs...)
-
-	bytes, err := parsed.Marshal()
-	if err != nil {
-		p.params.Logger.Errorw("failed to marshal offer", err)
-		return offer
-	}
-
-	return webrtc.SessionDescription{
-		Type: offer.Type,
-		SDP:  string(bytes),
-	}
-}
-
-func (p *ParticipantImpl) setCodecPreferencesVideoForPublisher(offer webrtc.SessionDescription) webrtc.SessionDescription {
-	parsed, lastVideo, err := p.TransportManager.GetLastUnmatchedMediaForOffer(offer, "video")
-	if err != nil || lastVideo == nil {
-		return offer
-	}
-	// last video is pending for publish, set codec preference
-	var streamID string
-	msid, ok := lastVideo.Attribute(sdp.AttrKeyMsid)
-	if !ok {
-		return offer
-	}
-	ids := strings.Split(msid, " ")
-	if len(ids) < 2 {
-		streamID = msid
-	} else {
-		streamID = ids[1]
-	}
-
-	p.pendingTracksLock.RLock()
-	_, info := p.getPendingTrack(streamID, livekit.TrackType_VIDEO)
-	if info == nil {
-		p.pendingTracksLock.RUnlock()
-		return offer
-	}
-	var mime string
-	for _, c := range info.Codecs {
-		if c.Cid == streamID {
-			mime = c.MimeType
-			break
-		}
-	}
-	if mime == "" && len(info.Codecs) > 0 {
-		mime = info.Codecs[0].MimeType
-	}
-	p.pendingTracksLock.RUnlock()
-
-	if mime == "" {
-		return offer
-	}
-
-	codecs, err := codecsFromMediaDescription(lastVideo)
-	if err != nil {
-		return offer
-	}
-
-	mime = strings.ToUpper(mime)
-	var preferredCodecs, leftCodecs []string
-	for _, c := range codecs {
-		if strings.HasSuffix(mime, strings.ToUpper(c.Name)) {
-			preferredCodecs = append(preferredCodecs, strconv.FormatInt(int64(c.PayloadType), 10))
-		} else {
-			leftCodecs = append(leftCodecs, strconv.FormatInt(int64(c.PayloadType), 10))
-		}
-	}
-
-	lastVideo.MediaName.Formats = append(lastVideo.MediaName.Formats[:0], preferredCodecs...)
-	lastVideo.MediaName.Formats = append(lastVideo.MediaName.Formats, leftCodecs...)
-
-	bytes, err := parsed.Marshal()
-	if err != nil {
-		p.params.Logger.Infow("failed to marshal offer", "error", err)
-		p.params.Logger.Errorw("failed to marshal offer", err)
-		return offer
-	}
-
-	return webrtc.SessionDescription{
-		Type: offer.Type,
-		SDP:  string(bytes),
-	}
+	p.TransportManager.HandleAnswer(answer)
 }
 
 func (p *ParticipantImpl) onPublisherAnswer(answer webrtc.SessionDescription) error {
 	p.params.Logger.Infow("sending answer", "transport", livekit.SignalTarget_PUBLISHER)
+	answer = p.configurePublisherAnswer(answer)
 	if err := p.writeMessage(&livekit.SignalResponse{
 		Message: &livekit.SignalResponse_Answer{
 			Answer: ToProtoSessionDescription(answer),
@@ -594,11 +499,24 @@ func (p *ParticipantImpl) handleMigrateMutedTrack() {
 			}
 		}
 	}
+	p.mutedTrackNotFired = append(p.mutedTrackNotFired, addedTracks...)
 	p.pendingTracksLock.Unlock()
 
 	for _, t := range addedTracks {
 		p.handleTrackPublished(t)
 	}
+}
+
+func (p *ParticipantImpl) removeMutedTrackNotFired(mt *MediaTrack) {
+	p.pendingTracksLock.Lock()
+	for i, t := range p.mutedTrackNotFired {
+		if t == mt {
+			p.mutedTrackNotFired[i] = p.mutedTrackNotFired[len(p.mutedTrackNotFired)-1]
+			p.mutedTrackNotFired = p.mutedTrackNotFired[:len(p.mutedTrackNotFired)-1]
+			break
+		}
+	}
+	p.pendingTracksLock.Unlock()
 }
 
 // AddTrack is called when client intends to publish track.
@@ -646,11 +564,14 @@ func (p *ParticipantImpl) Start() {
 }
 
 func (p *ParticipantImpl) Close(sendLeave bool, reason types.ParticipantCloseReason) error {
-	p.params.Logger.Infow("try close participant", "sendLeave", sendLeave, "reason", reason.String())
 	if p.isClosed.Swap(true) {
 		// already closed
 		return nil
 	}
+
+	p.params.Logger.Infow("participant closing", "sendLeave", sendLeave, "reason", reason.String())
+	p.clearDisconnectTimer()
+	p.clearMigrationTimer()
 
 	// send leave message
 	if sendLeave {
@@ -665,11 +586,17 @@ func (p *ParticipantImpl) Close(sendLeave bool, reason types.ParticipantCloseRea
 
 	p.supervisor.Stop()
 
-	p.UpTrackManager.Close(!sendLeave)
-
 	p.pendingTracksLock.Lock()
 	p.pendingTracks = make(map[string]*pendingTrackInfo)
+	closeMutedTrack := p.mutedTrackNotFired
+	p.mutedTrackNotFired = p.mutedTrackNotFired[:0]
 	p.pendingTracksLock.Unlock()
+
+	for _, t := range closeMutedTrack {
+		t.Close(!sendLeave)
+	}
+
+	p.UpTrackManager.Close(!sendLeave)
 
 	p.lock.Lock()
 	disallowedSubscriptions := make(map[livekit.TrackID]livekit.ParticipantID)
@@ -704,6 +631,8 @@ func (p *ParticipantImpl) Close(sendLeave bool, reason types.ParticipantCloseRea
 
 		p.TransportManager.Close()
 	}()
+
+	p.dataChannelStats.Report()
 	return nil
 }
 
@@ -755,6 +684,7 @@ func (p *ParticipantImpl) MaybeStartMigration(force bool, onStart func()) bool {
 		if p.isClosed.Load() || p.State() == livekit.ParticipantInfo_DISCONNECTED {
 			return
 		}
+		// TODO: change to debug once we are confident
 		p.params.Logger.Infow("closing subscriber peer connection to aid migration")
 
 		//
@@ -873,20 +803,9 @@ func (p *ParticipantImpl) GetConnectionQuality() *livekit.ConnectionQualityInfo 
 		avgScore = totalScore / float32(numTracks)
 	}
 
-	if avgScore < 4.5 {
-		p.params.Logger.Infow(
-			"low connection quality score",
-			"avgScore", avgScore,
-			"publisherScores", publisherScores,
-			"subscriberScores", subscriberScores,
-		)
-	}
-
-	rating := connectionquality.Score2Rating(avgScore)
-
 	return &livekit.ConnectionQualityInfo{
 		ParticipantSid: string(p.ID()),
-		Quality:        rating,
+		Quality:        connectionquality.Score2Rating(avgScore),
 		Score:          avgScore,
 	}
 }
@@ -966,18 +885,34 @@ func (p *ParticipantImpl) UpdateSubscribedTrackSettings(trackID livekit.TrackID,
 	return nil
 }
 
+func (p *ParticipantImpl) VerifySubscribeParticipantInfo(pID livekit.ParticipantID, version uint32) {
+	if v, ok := p.updateCache.Get(pID); ok && v.(uint32) >= version {
+		return
+	}
+
+	if f := p.params.GetParticipantInfo; f != nil {
+		if info := f(pID); info != nil {
+			p.SendParticipantUpdate([]*livekit.ParticipantInfo{info})
+		}
+	}
+}
+
 // AddSubscribedTrack adds a track to the participant's subscribed list
 func (p *ParticipantImpl) AddSubscribedTrack(subTrack types.SubscribedTrack) {
+	p.lock.Lock()
+	if v, ok := p.trackPublisherVersion[subTrack.ID()]; ok && v > subTrack.PublisherVersion() {
+		p.lock.Unlock()
+		p.params.Logger.Infow("ignoring add subscribedTrack from older version",
+			"current", v,
+			"requesting", subTrack.PublisherVersion(),
+			"trackID", subTrack.ID(),
+		)
+		return
+	}
 	p.params.Logger.Infow("added subscribedTrack",
 		"publisherID", subTrack.PublisherID(),
 		"publisherIdentity", subTrack.PublisherIdentity(),
 		"trackID", subTrack.ID())
-	p.lock.Lock()
-	if v, ok := p.trackPublisherVersion[subTrack.ID()]; ok && v > subTrack.PublisherVersion() {
-		p.lock.Unlock()
-		p.params.Logger.Infow("ignoring add subscribedTrack from older version", "current", v, "requesting", subTrack.PublisherVersion())
-		return
-	}
 	p.trackPublisherVersion[subTrack.ID()] = subTrack.PublisherVersion()
 
 	onSubscribedTo := p.onSubscribedTo
@@ -1011,17 +946,20 @@ func (p *ParticipantImpl) AddSubscribedTrack(subTrack types.SubscribedTrack) {
 
 // RemoveSubscribedTrack removes a track to the participant's subscribed list
 func (p *ParticipantImpl) RemoveSubscribedTrack(subTrack types.SubscribedTrack) {
+	p.lock.Lock()
+	if v, ok := p.trackPublisherVersion[subTrack.ID()]; ok && v > subTrack.PublisherVersion() {
+		p.lock.Unlock()
+		p.params.Logger.Infow("ignoring remove subscribedTrack from older version",
+			"current", v,
+			"requesting", subTrack.PublisherVersion(),
+			"trackID", subTrack.ID(),
+		)
+		return
+	}
 	p.params.Logger.Infow("removed subscribedTrack",
 		"publisherID", subTrack.PublisherID(),
 		"publisherIdentity", subTrack.PublisherIdentity(),
 		"trackID", subTrack.ID(), "kind", subTrack.DownTrack().Kind())
-
-	p.lock.Lock()
-	if v, ok := p.trackPublisherVersion[subTrack.ID()]; ok && v > subTrack.PublisherVersion() {
-		p.lock.Unlock()
-		p.params.Logger.Infow("ignoring remove subscribedTrack from older version", "current", v, "requesting", subTrack.PublisherVersion())
-		return
-	}
 	p.trackPublisherVersion[subTrack.ID()] = subTrack.PublisherVersion()
 
 	delete(p.subscribedTracks, subTrack.ID())
@@ -1107,6 +1045,7 @@ func (p *ParticipantImpl) UpdateRTT(rtt uint32) {
 	p.rttUpdatedAt = now
 	p.lastRTT = rtt
 	p.lock.Unlock()
+	p.TransportManager.UpdateRTT(rtt, true)
 
 	for _, pt := range p.GetPublishedTracks() {
 		pt.(types.LocalMediaTrack).SetRTT(rtt)
@@ -1147,7 +1086,8 @@ func (p *ParticipantImpl) setupTransportManager() error {
 		if iceConfig.PreferSub == types.PreferTls {
 			p.params.ClientConf.ForceRelay = livekit.ClientConfigSetting_ENABLED
 		} else {
-			p.params.ClientConf.ForceRelay = livekit.ClientConfigSetting_DISABLED
+			// UNSET indicates that clients could override RTCConfiguration to forceRelay
+			p.params.ClientConf.ForceRelay = livekit.ClientConfigSetting_UNSET
 		}
 		p.lock.Unlock()
 
@@ -1159,7 +1099,6 @@ func (p *ParticipantImpl) setupTransportManager() error {
 	tm.OnPublisherICECandidate(func(c *webrtc.ICECandidate) error {
 		return p.onICECandidate(c, livekit.SignalTarget_PUBLISHER)
 	})
-	tm.OnPublisherGetDTX(p.onPublisherGetDTX)
 	tm.OnPublisherAnswer(p.onPublisherAnswer)
 	tm.OnPublisherTrack(p.onMediaTrack)
 	tm.OnPublisherInitialConnected(p.onPublisherInitialConnected)
@@ -1279,6 +1218,8 @@ func (p *ParticipantImpl) onDataMessage(kind livekit.DataPacket_Kind, data []byt
 	if p.State() == livekit.ParticipantInfo_DISCONNECTED || !p.CanPublishData() {
 		return
 	}
+
+	p.dataChannelStats.AddBytes(uint64(len(data)), false)
 
 	dp := livekit.DataPacket{}
 	if err := proto.Unmarshal(data, &dp); err != nil {
@@ -1541,6 +1482,8 @@ func (p *ParticipantImpl) addPendingTrackLocked(req *livekit.AddTrackRequest) *l
 		DisableDtx: req.DisableDtx,
 		Source:     req.Source,
 		Layers:     req.Layers,
+		DisableRed: req.DisableRed,
+		Stereo:     req.Stereo,
 	}
 	p.setStableTrackID(req.Cid, ti)
 	for _, codec := range req.SimulcastCodecs {
@@ -1565,7 +1508,7 @@ func (p *ParticipantImpl) addPendingTrackLocked(req *livekit.AddTrackRequest) *l
 		} else {
 			p.pendingTracks[req.Cid].trackInfos = append(p.pendingTracks[req.Cid].trackInfos, ti)
 		}
-		p.params.Logger.Debugw("pending track queued", "trackID", ti.Sid, "track", ti.String(), "request", req.String())
+		p.params.Logger.Infow("pending track queued", "trackID", ti.Sid, "track", ti.String(), "request", req.String())
 		return nil
 	}
 
@@ -1573,7 +1516,7 @@ func (p *ParticipantImpl) addPendingTrackLocked(req *livekit.AddTrackRequest) *l
 	p.supervisor.SetPublicationMute(livekit.TrackID(ti.Sid), ti.Muted)
 
 	p.pendingTracks[req.Cid] = &pendingTrackInfo{trackInfos: []*livekit.TrackInfo{ti}}
-	p.params.Logger.Debugw("pending track added", "trackID", ti.Sid, "track", ti.String(), "request", req.String())
+	p.params.Logger.Infow("pending track added", "trackID", ti.Sid, "track", ti.String(), "request", req.String())
 	return ti
 }
 
@@ -1633,30 +1576,6 @@ func (p *ParticipantImpl) getPublisherConnectionQuality() map[livekit.TrackID]fl
 	return scores
 }
 
-func (p *ParticipantImpl) onPublisherGetDTX() bool {
-	p.pendingTracksLock.RLock()
-	defer p.pendingTracksLock.RUnlock()
-
-	//
-	// Although DTX is set per track, there are cases where
-	// pending track has to be looked up by kind. This happens
-	// when clients change track id between signalling and SDP.
-	// In that case, look at all pending tracks by kind and
-	// enable DTX even if one has it enabled.
-	//
-	// Most of the time in practice, there is going to be one
-	// audio kind track and hence this is fine.
-	//
-	for _, pti := range p.pendingTracks {
-		ti := pti.trackInfos[0]
-		if ti != nil && ti.Type == livekit.TrackType_AUDIO {
-			return !ti.DisableDtx
-		}
-	}
-
-	return false
-}
-
 func (p *ParticipantImpl) mediaTrackReceived(track *webrtc.TrackRemote, rtpReceiver *webrtc.RTPReceiver) (*MediaTrack, bool) {
 	p.pendingTracksLock.Lock()
 	newTrack := false
@@ -1691,8 +1610,11 @@ func (p *ParticipantImpl) mediaTrackReceived(track *webrtc.TrackRemote, rtpRecei
 	}
 	p.pendingTracksLock.Unlock()
 
-	if mt.AddReceiver(rtpReceiver, track, p.twcc, mid) && newTrack {
-		p.handleTrackPublished(mt)
+	if mt.AddReceiver(rtpReceiver, track, p.twcc, mid) {
+		p.removeMutedTrackNotFired(mt)
+		if newTrack {
+			p.handleTrackPublished(mt)
+		}
 	}
 
 	return mt, newTrack
@@ -1747,7 +1669,7 @@ func (p *ParticipantImpl) addMediaTrack(signalCid string, sdpCid string, ti *liv
 		AudioConfig:         p.params.AudioConfig,
 		VideoConfig:         p.params.VideoConfig,
 		Telemetry:           p.params.Telemetry,
-		Logger:              LoggerWithTrack(p.params.Logger, livekit.TrackID(ti.Sid)),
+		Logger:              LoggerWithTrack(p.params.Logger, livekit.TrackID(ti.Sid), false),
 		SubscriberConfig:    p.params.Config.Subscriber,
 		PLIThrottleConfig:   p.params.PLIThrottleConfig,
 		SimTracks:           p.params.SimTracks,
@@ -2020,12 +1942,12 @@ func (p *ParticipantImpl) setDowntracksConnected() {
 	}
 }
 
-func (p *ParticipantImpl) CacheDownTrack(trackID livekit.TrackID, rtpTransceiver *webrtc.RTPTransceiver, forwarderState sfu.ForwarderState) {
+func (p *ParticipantImpl) CacheDownTrack(trackID livekit.TrackID, rtpTransceiver *webrtc.RTPTransceiver, downTrack sfu.DownTrackState) {
 	p.lock.Lock()
 	if existing := p.cachedDownTracks[trackID]; existing != nil && existing.transceiver != rtpTransceiver {
 		p.params.Logger.Infow("cached transceiver changed", "trackID", trackID)
 	}
-	p.cachedDownTracks[trackID] = &downTrackState{transceiver: rtpTransceiver, forwarder: forwarderState}
+	p.cachedDownTracks[trackID] = &downTrackState{transceiver: rtpTransceiver, downTrack: downTrack}
 	p.lock.Unlock()
 }
 
@@ -2040,25 +1962,24 @@ func (p *ParticipantImpl) UncacheDownTrack(rtpTransceiver *webrtc.RTPTransceiver
 	p.lock.Unlock()
 }
 
-func (p *ParticipantImpl) GetCachedDownTrack(trackID livekit.TrackID) (*webrtc.RTPTransceiver, sfu.ForwarderState) {
+func (p *ParticipantImpl) GetCachedDownTrack(trackID livekit.TrackID) (*webrtc.RTPTransceiver, sfu.DownTrackState) {
 	p.lock.RLock()
 	defer p.lock.RUnlock()
 
 	dts := p.cachedDownTracks[trackID]
 	if dts != nil {
-		return dts.transceiver, dts.forwarder
+		return dts.transceiver, dts.downTrack
 	}
 
-	return nil, sfu.ForwarderState{}
+	return nil, sfu.DownTrackState{}
 }
 
-func (p *ParticipantImpl) onAnyTransportNegotiationFailed() {
-	p.params.Logger.Infow("negotiation failed, starting full reconnect")
+func (p *ParticipantImpl) issueFullReconnect(reason types.ParticipantCloseReason) {
 	_ = p.writeMessage(&livekit.SignalResponse{
 		Message: &livekit.SignalResponse_Leave{
 			Leave: &livekit.LeaveRequest{
 				CanReconnect: true,
-				Reason:       types.ParticipantCloseReasonNegotiateFailed.ToDisconnectReason(),
+				Reason:       reason.ToDisconnectReason(),
 			},
 		},
 	})
@@ -2068,8 +1989,26 @@ func (p *ParticipantImpl) onAnyTransportNegotiationFailed() {
 	p.supervisor.Stop()
 }
 
-func (p *ParticipantImpl) EnqueueSubscribeTrack(trackID livekit.TrackID, f func(sub types.LocalParticipant) error) {
-	p.params.Logger.Debugw("queuing subscribe", "trackID", trackID)
+func (p *ParticipantImpl) onPublicationError(trackID livekit.TrackID) {
+	p.params.Logger.Infow("publication failed", "trackID", trackID)
+	if p.params.ReconnectOnPublicationError {
+		p.params.Logger.Infow("starting full reconnect")
+		p.issueFullReconnect(types.ParticipantCloseReasonPublicationError)
+	}
+}
+
+func (p *ParticipantImpl) onAnyTransportNegotiationFailed() {
+	p.params.Logger.Infow("negotiation failed, starting full reconnect")
+	p.issueFullReconnect(types.ParticipantCloseReasonNegotiateFailed)
+}
+
+func (p *ParticipantImpl) EnqueueSubscribeTrack(trackID livekit.TrackID, isRelayed bool, f func(sub types.LocalParticipant) error) bool {
+	// do not queue subscription is participant is already closed/disconnected
+	if p.isClosed.Load() || p.State() == livekit.ParticipantInfo_DISCONNECTED {
+		return false
+	}
+
+	p.params.Logger.Debugw("queuing subscribe", "trackID", trackID, "relayed", isRelayed)
 
 	p.supervisor.UpdateSubscription(trackID, true)
 
@@ -2081,10 +2020,16 @@ func (p *ParticipantImpl) EnqueueSubscribeTrack(trackID livekit.TrackID, f func(
 	p.lock.Unlock()
 
 	go p.ProcessSubscriptionRequestsQueue(trackID)
+	return true
 }
 
-func (p *ParticipantImpl) EnqueueUnsubscribeTrack(trackID livekit.TrackID, willBeResumed bool, f func(subscriberID livekit.ParticipantID, willBeResumed bool) error) {
-	p.params.Logger.Debugw("queuing unsubscribe", "trackID", trackID)
+func (p *ParticipantImpl) EnqueueUnsubscribeTrack(
+	trackID livekit.TrackID,
+	isRelayed bool,
+	willBeResumed bool,
+	f func(subscriberID livekit.ParticipantID, willBeResumed bool) error,
+) bool {
+	p.params.Logger.Debugw("queuing unsubscribe", "trackID", trackID, "relayed", isRelayed)
 
 	p.supervisor.UpdateSubscription(trackID, false)
 
@@ -2097,6 +2042,7 @@ func (p *ParticipantImpl) EnqueueUnsubscribeTrack(trackID livekit.TrackID, willB
 	p.lock.Unlock()
 
 	go p.ProcessSubscriptionRequestsQueue(trackID)
+	return true
 }
 
 func (p *ParticipantImpl) ProcessSubscriptionRequestsQueue(trackID livekit.TrackID) {

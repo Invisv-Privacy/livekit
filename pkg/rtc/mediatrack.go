@@ -10,6 +10,7 @@ import (
 	"go.uber.org/atomic"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/livekit/mediatransportutil/pkg/twcc"
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
 
@@ -17,7 +18,6 @@ import (
 	"github.com/livekit/livekit-server/pkg/rtc/types"
 	"github.com/livekit/livekit-server/pkg/sfu"
 	"github.com/livekit/livekit-server/pkg/sfu/buffer"
-	"github.com/livekit/livekit-server/pkg/sfu/twcc"
 	"github.com/livekit/livekit-server/pkg/telemetry"
 )
 
@@ -64,10 +64,10 @@ func NewMediaTrack(params MediaTrackParams) *MediaTrack {
 	t.MediaTrackReceiver = NewMediaTrackReceiver(MediaTrackReceiverParams{
 		TrackInfo:           params.TrackInfo,
 		MediaTrack:          t,
+		IsRelayed:           false,
 		ParticipantID:       params.ParticipantID,
 		ParticipantIdentity: params.ParticipantIdentity,
 		ParticipantVersion:  params.ParticipantVersion,
-		BufferFactory:       params.BufferFactory,
 		ReceiverConfig:      params.ReceiverConfig,
 		SubscriberConfig:    params.SubscriberConfig,
 		Telemetry:           params.Telemetry,
@@ -313,6 +313,11 @@ func (t *MediaTrack) AddReceiver(receiver *webrtc.RTPReceiver, track *webrtc.Tra
 	}
 
 	buff.Bind(receiver.GetParameters(), track.Codec().RTPCodecCapability)
+
+	// if subscriber request fps before fps calculated, update them after fps updated.
+	buff.OnFpsChanged(func() {
+		t.MediaTrackSubscriptions.UpdateVideoLayers()
+	})
 	return newCodec
 }
 
