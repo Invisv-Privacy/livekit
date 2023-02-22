@@ -345,7 +345,13 @@ func (r *RoomManager) StartSession(
 	}
 	if err = room.Join(participant, &opts, r.iceServersForRoom(protoRoom, iceConfig.PreferenceSubscriber == livekit.ICECandidateType_ICT_TLS)); err != nil {
 		pLogger.Errorw("could not join room", err)
-		_ = participant.Close(true, types.ParticipantCloseReasonJoinFailed)
+		var closeReason types.ParticipantCloseReason
+		if errors.Is(err, rtc.ErrMaxParticipantsExceeded) {
+			closeReason = types.ParticipantCloseReasonCapacityReached
+		} else {
+			closeReason = types.ParticipantCloseReasonJoinFailed
+		}
+		_ = participant.Close(true, closeReason)
 		return err
 	}
 	if err = r.roomStore.StoreParticipant(ctx, roomName, participant.ToProto()); err != nil {
