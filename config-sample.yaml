@@ -141,6 +141,8 @@ keys:
 #   empty_timeout: 300
 #   # limit number of participants that can be in a room, 0 for no limit
 #   max_participants: 0
+#   # number of seconds a room can last for, 0 for no limit
+#   room_timeout: 0
 #   # only accept specific codecs for clients publishing to this room
 #   # this is useful to standardize codecs across clients
 #   # other supported codecs are video/h264
